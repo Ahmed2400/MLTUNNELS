@@ -1,7 +1,7 @@
 """
-Bridge/Dam Condition Assessment — 3-Class Classification
-Classes: Good/Excellent (1+2) | Fair (3) | Poor/Failing (4)
-Pipeline: SMOTE + Optuna (LGB / CatBoost / ExtraTrees) + Soft Voting
+Bridge Condition — 3-Class Classification
+Classes: G (Good) | F (Fair) | P (Poor)
+Pipeline: Feature engineering → MI selection → SMOTE → Optuna (LGB/CB/ET) → Soft Voting
 """
 import pandas as pd
 import numpy as np
@@ -13,177 +13,135 @@ import warnings, os, time
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
-from sklearn.model_selection import StratifiedKFold, train_test_split, cross_val_score
-from sklearn.metrics import (classification_report, confusion_matrix, accuracy_score,
-                             f1_score, precision_recall_fscore_support)
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import (classification_report, confusion_matrix,
+                             accuracy_score, f1_score,
+                             precision_recall_fscore_support)
 from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.feature_selection import mutual_info_classif
+from sklearn.preprocessing import LabelEncoder
 
 import lightgbm as lgb
 from catboost import CatBoostClassifier
 from imblearn.over_sampling import SMOTE
 import optuna; optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-TUNNELS_PATH = "/root/.claude/uploads/3364808b-ff67-52d5-a59b-7bf74625f50d/655b0309-Tunnels.xlsx"
-NATION_PATH  = "/root/.claude/uploads/3364808b-ff67-52d5-a59b-7bf74625f50d/a18014c9-nation.xlsx"
+DATA_PATH = ("/root/.claude/uploads/aad3e737-34bf-541c-bbe3-aa6fc9f9f330/"
+             "0654dfe0-datatobeusedMLPclassesninenotthree.xlsx")
 
-# 3-class label map (merge Excellent+Good → "Good/Excellent")
-LABEL_MAP3 = {1: "Good/Excellent", 2: "Fair", 3: "Poor/Failing"}
+LABEL_MAP = {"G": "Good", "F": "Fair", "P": "Poor"}
+PALETTE   = {"Good": "#4CAF50", "Fair": "#FF9800", "Poor": "#F44336"}
 
-# ── Load & join ───────────────────────────────────────────────────────────────
-df_t   = pd.read_excel(TUNNELS_PATH)
-df_raw = pd.read_excel(NATION_PATH, header=1)
-print(f"Raw tunnels: {df_t.shape}")
-print(f"4-class dist: {df_t['Condition Assessment'].value_counts().sort_index().to_dict()}")
+# ── 1. Load ───────────────────────────────────────────────────────────────────
+df = pd.read_excel(DATA_PATH)
+print(f"Shape: {df.shape}")
+print(f"Target dist:\n{df['BRIDGE_CONDITION'].value_counts().sort_index()}\n")
 
-EXTRA = ['Dam Name','Hazard Potential Classification','Last Inspection Date',
-         'Inspection Frequency','EAP Prepared','Primary Purpose','Primary Owner Type',
-         'State','State Regulated Dam','Federally Regulated Dam']
-raw_dedup = (df_raw[EXTRA]
-             .dropna(subset=['Dam Name'])
-             .drop_duplicates(subset='Dam Name'))
-df = df_t.merge(raw_dedup, on='Dam Name', how='left')
-print(f"After join: {df.shape}")
+# ── 2. Pre-process ────────────────────────────────────────────────────────────
+df["PERCENT_ADT_TRUCK_109"] = df["PERCENT_ADT_TRUCK_109"].fillna(
+    df["PERCENT_ADT_TRUCK_109"].median()
+)
 
-# ── Remap 4 classes → 3 classes ───────────────────────────────────────────────
-# Original: 1=Excellent, 2=Good, 3=Fair, 4=Poor/Failing
-# New:      1=Good/Excellent, 2=Fair, 3=Poor/Failing
-remap = {1: 1, 2: 1, 3: 2, 4: 3}
-df["Condition3"] = df["Condition Assessment"].map(remap)
-print(f"3-class dist: {df['Condition3'].value_counts().sort_index().to_dict()}")
+# Encode target: G→0, F→1, P→2
+le = LabelEncoder()
+le.classes_ = np.array(["G", "F", "P"])
+y_raw = df["BRIDGE_CONDITION"]
+y = pd.Series(le.transform(y_raw), name="label")   # 0=G, 1=F, 2=P
 
-# ── Encode categorical features from nation.xlsx ───────────────────────────────
-eap_map  = {"Yes": 3, "Not Required": 2, "No": 1}
-haz_map  = {"High": 4, "Significant": 3, "Undetermined": 2, "Low": 1}
-freq_map = {"Annual": 5, "Biennial": 4, "Periodic": 3, "Not Applicable": 2, "Not Required": 1}
-
-df["EAP_enc"]      = df["EAP Prepared"].map(eap_map).fillna(0).astype(int)
-df["Hazard_enc"]   = df["Hazard Potential Classification"].map(haz_map).fillna(0).astype(int)
-df["InspFreq_enc"] = df["Inspection Frequency"].map(freq_map).fillna(0).astype(int)
-df["StateReg_enc"] = (df["State Regulated Dam"].astype(str).str.upper() == "YES").astype(int)
-df["FedReg_enc"]   = (df["Federally Regulated Dam"].astype(str).str.upper() == "YES").astype(int)
-
-# Target-mean encodings (computed on 3-class target)
-for col, enc_name in [("State","State_enc"), ("Primary Purpose","Purpose_enc"),
-                       ("Primary Owner Type","Owner_enc")]:
-    mean_map = df.groupby(col)["Condition3"].mean()
-    df[enc_name] = df[col].map(mean_map).fillna(df["Condition3"].mean())
-
-df["LastInsp_date"]  = pd.to_datetime(df["Last Inspection Date"], errors="coerce")
-df["DaysSinceInsp"]  = (pd.Timestamp("2024-01-01") - df["LastInsp_date"]).dt.days.fillna(-1)
-
-# ── Feature engineering ────────────────────────────────────────────────────────
+# ── 3. Feature engineering ────────────────────────────────────────────────────
 def engineer(d):
     d = d.copy()
-    d["Age"]              = 2024 - d["Year Completed"]
-    d["Age_sq"]           = d["Age"] ** 2
-    d["Age_bin"]          = pd.cut(d["Age"], [0,20,40,60,80,200], labels=False)
-    hcols = ["Dam Height (Ft)","Hydraulic Height (Ft)","Structural Height (Ft)","NID Height (Ft)"]
-    d["Height_range"]     = d["Dam Height (Ft)"] - d["Hydraulic Height (Ft)"]
-    d["Height_ratio"]     = d["Hydraulic Height (Ft)"] / (d["Dam Height (Ft)"] + 1)
-    d["Height_mean"]      = d[hcols].mean(axis=1)
-    d["Height_spread"]    = d[hcols].max(axis=1) - d[hcols].min(axis=1)
-    d["Storage_ratio"]    = d["NID Storage (Acre-Ft)"] / (d["Max Storage (Acre-Ft)"] + 1)
-    d["Normal_max_ratio"] = d["Normal Storage (Acre-Ft)"] / (d["Max Storage (Acre-Ft)"] + 1)
-    d["Storage_diff"]     = d["Max Storage (Acre-Ft)"] - d["Normal Storage (Acre-Ft)"]
-    d["Storage_per_area"] = d["NID Storage (Acre-Ft)"] / (d["Surface Area (Acres)"] + 1)
-    d["Log_NID"]          = np.log1p(d["NID Storage (Acre-Ft)"])
-    d["Log_vol"]          = np.log1p(d["Volume (Cubic Yards)"])
-    d["Vol_per_ht"]       = d["Volume (Cubic Yards)"] / (d["Dam Height (Ft)"] + 1)
-    d["Log_Q"]            = np.log1p(d["Max Discharge (Cubic Ft/Second)"])
-    d["Q_per_area"]       = d["Max Discharge (Cubic Ft/Second)"] / (d["Surface Area (Acres)"] + 1)
-    d["Q_per_drain"]      = d["Max Discharge (Cubic Ft/Second)"] / (d["Drainage Area (Sq Miles)"] + 1)
-    d["Q_per_ht"]         = d["Max Discharge (Cubic Ft/Second)"] / (d["Dam Height (Ft)"] + 1)
-    d["Log_Q_area"]       = np.log1p(d["Q_per_area"])
-    d["Spill_per_ht"]     = d["Spillway Width (Ft)"] / (d["Dam Height (Ft)"] + 1)
-    d["Log_spill"]        = np.log1p(d["Spillway Width (Ft)"])
-    d["Compactness"]      = d["Dam Height (Ft)"] / (d["Dam Length (Ft)"] + 1)
-    d["Log_len"]          = np.log1p(d["Dam Length (Ft)"])
-    d["Log_area"]         = np.log1p(d["Surface Area (Acres)"])
-    d["Log_drain"]        = np.log1p(d["Drainage Area (Sq Miles)"])
-    d["Age_x_ht"]         = d["Age"] * d["Dam Height (Ft)"]
-    d["Age_x_vol"]        = d["Age"] * d["Log_vol"]
-    d["Age_x_storage"]    = d["Age"] * d["Log_NID"]
-    d["Age_x_Q"]          = d["Age"] * d["Log_Q"]
-    d["Age_x_core"]       = d["Age"] * d["Core Types"]
-    d["Age_x_found"]      = d["Age"] * d["Foundation"]
-    d["Type_x_age"]       = d["Primary Dam Type"] * d["Age"]
-    d["Core_x_found"]     = d["Core Types"] * d["Foundation"]
-    d["Core_x_ht"]        = d["Core Types"] * d["Dam Height (Ft)"]
-    d["Found_x_ht"]       = d["Foundation"] * d["Dam Height (Ft)"]
-    d["Spill_x_Q"]        = d["Spillway Type"] * d["Log_Q"]
-    n = d["Dam Name"].astype(str).str.lower()
-    d["nm_len"]           = d["Dam Name"].astype(str).str.len()
-    d["nm_words"]         = d["Dam Name"].astype(str).str.split().str.len()
-    d["nm_detention"]     = n.str.contains("detention").astype(int)
-    d["nm_scs"]           = n.str.contains("scs").astype(int)
-    d["nm_has_num"]       = d["Dam Name"].astype(str).str.contains(r'\d').astype(int)
-    d["Log_dist"]         = np.log1p(d["Distance to Nearest City (Miles)"])
-    d["Is_urban"]         = (d["Distance to Nearest City (Miles)"] <= 2).astype(int)
-    for f, s in [("Age","age"),("Hydraulic Height (Ft)","hh"),
-                 ("NID Storage (Acre-Ft)","nid"),("Log_Q","lq")]:
-        d[f"sq_{s}"] = d[f] ** 2
-    for c, s in [("Dam Height (Ft)","ht"),("Volume (Cubic Yards)","vol"),
-                 ("Max Discharge (Cubic Ft/Second)","Q"),("NID Storage (Acre-Ft)","stor"),
-                 ("Spillway Width (Ft)","spill"),("Surface Area (Acres)","area")]:
-        d[f"rk_{s}"] = d[c].rank(pct=True)
-    # Nation.xlsx interactions
-    d["EAP_x_age"]         = d["EAP_enc"]    * d["Age"]
-    d["Haz_x_age"]         = d["Hazard_enc"] * d["Age"]
-    d["EAP_x_haz"]         = d["EAP_enc"]    * d["Hazard_enc"]
-    d["EAP_x_ht"]          = d["EAP_enc"]    * d["Dam Height (Ft)"]
-    d["Haz_x_storage"]     = d["Hazard_enc"] * d["Log_NID"]
-    d["State_x_haz"]       = d["State_enc"]  * d["Hazard_enc"]
-    d["Insp_x_age"]        = d["InspFreq_enc"] * d["Age"]
-    d["DaysSinceInsp_log"] = np.log1p(d["DaysSinceInsp"].clip(lower=0))
+    # Log transforms (right-skewed)
+    d["Log_ADT"]       = np.log1p(d["ADT_029"])
+    d["Log_MaxSpan"]   = np.log1p(d["MAX_SPAN_LEN_MT_048"])
+    d["Log_StrLen"]    = np.log1p(d["STRUCTURE_LEN_MT_049"])
+    d["Log_Width"]     = np.log1p(d["ROADWAY_WIDTH_MT_051"])
+    d["Log_TruckPct"]  = np.log1p(d["PERCENT_ADT_TRUCK_109"])
+    d["Log_FI"]        = np.log1p(d["FI"])
+    d["Log_FTC"]       = np.log1p(d["FTC"])
+
+    # Ratios
+    d["Span_over_Len"] = d["MAX_SPAN_LEN_MT_048"] / (d["STRUCTURE_LEN_MT_049"] + 1)
+    d["Width_over_Len"]= d["ROADWAY_WIDTH_MT_051"] / (d["STRUCTURE_LEN_MT_049"] + 1)
+    d["ADT_per_width"] = d["ADT_029"] / (d["ROADWAY_WIDTH_MT_051"] + 1)
+    d["TruckADT"]      = d["ADT_029"] * d["PERCENT_ADT_TRUCK_109"] / 100
+
+    # Climate features
+    d["TempRange"]     = d["TmaxAVG"] - d["TminAVG"]
+    d["TempMid"]       = (d["TmaxAVG"] + d["TminAVG"]) / 2
+    d["ClimateStress"] = d["FI"] + d["FTC"]          # freeze damage proxy
+    d["Log_Precip"]    = np.log1p(d["PRCPPEAK"])
+
+    # Age interactions (deterioration drivers)
+    d["Age_sq"]        = d["Age"] ** 2
+    d["Age_x_FTC"]     = d["Age"] * d["FTC"]
+    d["Age_x_FI"]      = d["Age"] * d["FI"]
+    d["Age_x_TruckADT"]= d["Age"] * np.log1p(d["TruckADT"])
+    d["Age_x_Precip"]  = d["Age"] * d["PRCPPEAK"]
+    d["Age_x_Span"]    = d["Age"] * d["MAX_SPAN_LEN_MT_048"]
+    # Structure interactions
+    d["Kind_x_Type"]   = d["STRUCTURE_KIND_043A"] * d["STRUCTURE_TYPE_043B"]
+    d["Kind_x_Age"]    = d["STRUCTURE_KIND_043A"] * d["Age"]
+    d["Type_x_Span"]   = d["STRUCTURE_TYPE_043B"] * d["Log_MaxSpan"]
+    d["FuncClass_x_ADT"]= d["FUNCTIONAL_CLASS_026"] * d["Log_ADT"]
+
+    # Rank percentiles
+    for c, s in [("Age","rk_age"), ("ADT_029","rk_adt"), ("MAX_SPAN_LEN_MT_048","rk_span"),
+                 ("STRUCTURE_LEN_MT_049","rk_strlen"),
+                 ("FI","rk_fi"), ("FTC","rk_ftc"), ("PRCPPEAK","rk_precip")]:
+        d[s] = d[c].rank(pct=True)
+
+    # Squared originals
+    d["sq_Age"]    = d["Age"] ** 2
+    d["sq_FTC"]    = d["FTC"] ** 2
+    d["sq_FI"]     = d["FI"] ** 2
     return d
 
-df = engineer(df)
+feat_base = ["FUNCTIONAL_CLASS_026","Age","ADT_029","STRUCTURE_KIND_043A",
+             "STRUCTURE_TYPE_043B","MAX_SPAN_LEN_MT_048","STRUCTURE_LEN_MT_049",
+             "ROADWAY_WIDTH_MT_051","PERCENT_ADT_TRUCK_109",
+             "TminAVG","TmaxAVG","PRCPPEAK","FI","FTC"]
+# LOWEST_RATING excluded — it is the direct deterministic source of BRIDGE_CONDITION
+# (Rating 3-4 = Poor, 5-6 = Fair, 7-9 = Good) and would cause data leakage.
 
-DROP = ["Dam Name","Condition Assessment","Condition3","Year Completed",
-        "EAP Prepared","Hazard Potential Classification","State",
-        "Inspection Frequency","Primary Purpose","Primary Owner Type",
-        "State Regulated Dam","Federally Regulated Dam",
-        "Last Inspection Date","LastInsp_date"]
-feat_cols = [c for c in df.columns if c not in DROP]
-X = df[feat_cols].fillna(0).replace([np.inf, -np.inf], 0)
-y = df["Condition3"]
-print(f"\nFeatures: {len(feat_cols)}")
-print(f"Class distribution:\n{y.value_counts().sort_index()}\n")
+df_feat = engineer(df[feat_base].copy())
+feat_cols = df_feat.columns.tolist()
+X = df_feat.fillna(0).replace([np.inf, -np.inf], 0)
+print(f"Total features: {len(feat_cols)}")
+print(f"Class counts (G=0, F=1, P=2): {y.value_counts().sort_index().to_dict()}\n")
 
-# ── Train/test split ──────────────────────────────────────────────────────────
+# ── 4. Train/test split ───────────────────────────────────────────────────────
 X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2,
                                            random_state=42, stratify=y)
 
-# ── MI feature selection ──────────────────────────────────────────────────────
+# ── 5. MI feature selection ───────────────────────────────────────────────────
 print("Mutual information selection ...")
 mi = mutual_info_classif(X_tr, y_tr, random_state=42)
 mi_s = pd.Series(mi, index=feat_cols).sort_values(ascending=False)
 sel = mi_s[mi_s > 0].index.tolist()
-print(f"  {len(sel)}/{len(feat_cols)} features kept")
+print(f"  {len(sel)}/{len(feat_cols)} features retained")
 X_tr_s = X_tr[sel]; X_te_s = X_te[sel]
 
-# ── SMOTE balancing ───────────────────────────────────────────────────────────
+# ── 6. SMOTE ─────────────────────────────────────────────────────────────────
 print("SMOTE ...")
 X_bal, y_bal = SMOTE(random_state=42, k_neighbors=5).fit_resample(X_tr_s, y_tr)
 print(f"  Balanced: {X_bal.shape}  {pd.Series(y_bal).value_counts().sort_index().to_dict()}")
 Xb_tr, Xb_val, yb_tr, yb_val = train_test_split(X_bal, y_bal, test_size=0.2,
                                                    random_state=42, stratify=y_bal)
 
-# ── Optuna: LightGBM ─────────────────────────────────────────────────────────
-print("\n=== Optuna: LightGBM (25 trials) ==="); t0 = time.time()
+# ── 7. Optuna: LightGBM ──────────────────────────────────────────────────────
+print("\n=== Optuna: LightGBM (30 trials) ==="); t0 = time.time()
 def obj_lgb(trial):
     p = dict(
-        n_estimators      = trial.suggest_int("n_estimators", 50, 400),
-        num_leaves        = trial.suggest_int("num_leaves", 15, 100),
+        n_estimators      = trial.suggest_int("n_estimators", 100, 600),
+        num_leaves        = trial.suggest_int("num_leaves", 20, 120),
         learning_rate     = trial.suggest_float("learning_rate", 0.02, 0.3, log=True),
-        max_depth         = trial.suggest_int("max_depth", 3, 10),
-        min_child_samples = trial.suggest_int("min_child_samples", 5, 50),
+        max_depth         = trial.suggest_int("max_depth", 3, 12),
+        min_child_samples = trial.suggest_int("min_child_samples", 5, 60),
         subsample         = trial.suggest_float("subsample", 0.5, 1.0),
         colsample_bytree  = trial.suggest_float("colsample_bytree", 0.4, 1.0),
-        reg_alpha         = trial.suggest_float("reg_alpha", 1e-4, 3, log=True),
-        reg_lambda        = trial.suggest_float("reg_lambda", 1e-4, 3, log=True),
+        reg_alpha         = trial.suggest_float("reg_alpha", 1e-4, 5, log=True),
+        reg_lambda        = trial.suggest_float("reg_lambda", 1e-4, 5, log=True),
     )
     m = lgb.LGBMClassifier(**p, class_weight="balanced",
                            random_state=42, verbose=-1, n_jobs=1)
@@ -191,17 +149,17 @@ def obj_lgb(trial):
     return f1_score(yb_val, m.predict(Xb_val), average="weighted")
 
 sl = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
-sl.optimize(obj_lgb, n_trials=25, show_progress_bar=False)
+sl.optimize(obj_lgb, n_trials=30, show_progress_bar=False)
 lgb_p = {**dict(sl.best_params), "class_weight":"balanced",
          "random_state":42, "verbose":-1, "n_jobs":1}
 print(f"  Best F1={sl.best_value:.4f}  ({time.time()-t0:.0f}s)")
 lgb_m = lgb.LGBMClassifier(**lgb_p); lgb_m.fit(X_bal, y_bal)
 
-# ── Optuna: CatBoost ─────────────────────────────────────────────────────────
-print("\n=== Optuna: CatBoost (15 trials) ==="); t0 = time.time()
+# ── 8. Optuna: CatBoost ──────────────────────────────────────────────────────
+print("\n=== Optuna: CatBoost (20 trials) ==="); t0 = time.time()
 def obj_cb(trial):
     p = dict(
-        iterations          = trial.suggest_int("iterations", 50, 350),
+        iterations          = trial.suggest_int("iterations", 100, 500),
         depth               = trial.suggest_int("depth", 3, 8),
         learning_rate       = trial.suggest_float("learning_rate", 0.02, 0.3, log=True),
         l2_leaf_reg         = trial.suggest_float("l2_leaf_reg", 1e-2, 10, log=True),
@@ -213,19 +171,19 @@ def obj_cb(trial):
     return f1_score(yb_val, m.predict(Xb_val), average="weighted")
 
 sc = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
-sc.optimize(obj_cb, n_trials=15, show_progress_bar=False)
+sc.optimize(obj_cb, n_trials=20, show_progress_bar=False)
 cb_p = {**dict(sc.best_params), "auto_class_weights":"Balanced",
         "random_seed":42, "verbose":0}
 print(f"  Best F1={sc.best_value:.4f}  ({time.time()-t0:.0f}s)")
 cb_m = CatBoostClassifier(**cb_p); cb_m.fit(X_bal, y_bal, verbose=0)
 
-# ── Optuna: ExtraTrees ───────────────────────────────────────────────────────
-print("\n=== Optuna: ExtraTrees (15 trials) ==="); t0 = time.time()
+# ── 9. Optuna: ExtraTrees ────────────────────────────────────────────────────
+print("\n=== Optuna: ExtraTrees (20 trials) ==="); t0 = time.time()
 def obj_et(trial):
     p = dict(
-        n_estimators     = trial.suggest_int("n_estimators", 100, 500),
+        n_estimators     = trial.suggest_int("n_estimators", 100, 600),
         max_depth        = trial.suggest_int("max_depth", 5, 30),
-        min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10),
+        min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 15),
         max_features     = trial.suggest_float("max_features", 0.3, 1.0),
     )
     m = ExtraTreesClassifier(**p, class_weight="balanced", random_state=42, n_jobs=1)
@@ -233,24 +191,25 @@ def obj_et(trial):
     return f1_score(yb_val, m.predict(Xb_val), average="weighted")
 
 se = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
-se.optimize(obj_et, n_trials=15, show_progress_bar=False)
+se.optimize(obj_et, n_trials=20, show_progress_bar=False)
 et_p = {**se.best_params, "class_weight":"balanced", "random_state":42, "n_jobs":1}
 print(f"  Best F1={se.best_value:.4f}  ({time.time()-t0:.0f}s)")
 et_m = ExtraTreesClassifier(**et_p); et_m.fit(X_bal, y_bal)
 
-# ── Optuna: LightGBM v2 ──────────────────────────────────────────────────────
-print("\n=== Optuna: LightGBM-v2 (20 trials) ==="); t0 = time.time()
+# ── 10. Optuna: LightGBM v2 ──────────────────────────────────────────────────
+print("\n=== Optuna: LightGBM-v2 (25 trials) ==="); t0 = time.time()
 def obj_lgb2(trial):
     p = dict(
-        n_estimators      = trial.suggest_int("n_estimators", 100, 600),
-        num_leaves        = trial.suggest_int("num_leaves", 20, 150),
-        learning_rate     = trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
-        max_depth         = trial.suggest_int("max_depth", 4, 12),
+        n_estimators      = trial.suggest_int("n_estimators", 200, 800),
+        num_leaves        = trial.suggest_int("num_leaves", 30, 200),
+        learning_rate     = trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+        max_depth         = trial.suggest_int("max_depth", 4, 14),
         min_child_samples = trial.suggest_int("min_child_samples", 5, 40),
         subsample         = trial.suggest_float("subsample", 0.5, 1.0),
         colsample_bytree  = trial.suggest_float("colsample_bytree", 0.4, 1.0),
         reg_alpha         = trial.suggest_float("reg_alpha", 1e-4, 5, log=True),
         reg_lambda        = trial.suggest_float("reg_lambda", 1e-4, 5, log=True),
+        min_split_gain    = trial.suggest_float("min_split_gain", 0.0, 0.5),
     )
     m = lgb.LGBMClassifier(**p, class_weight="balanced",
                            random_state=0, verbose=-1, n_jobs=1)
@@ -258,14 +217,14 @@ def obj_lgb2(trial):
     return f1_score(yb_val, m.predict(Xb_val), average="weighted")
 
 sl2 = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=0))
-sl2.optimize(obj_lgb2, n_trials=20, show_progress_bar=False)
+sl2.optimize(obj_lgb2, n_trials=25, show_progress_bar=False)
 lgb_p2 = {**dict(sl2.best_params), "class_weight":"balanced",
            "random_state":0, "verbose":-1, "n_jobs":1}
 print(f"  Best F1={sl2.best_value:.4f}  ({time.time()-t0:.0f}s)")
 lgb_m2 = lgb.LGBMClassifier(**lgb_p2); lgb_m2.fit(X_bal, y_bal)
 
-# ── Evaluate all + soft/weighted vote ────────────────────────────────────────
-print("\n=== Evaluating on test set ===")
+# ── 11. Evaluate + ensemble ───────────────────────────────────────────────────
+print("\n=== Test-set evaluation ===")
 lgb_pred  = lgb_m.predict(X_te_s)
 cb_pred   = cb_m.predict(X_te_s)
 et_pred   = et_m.predict(X_te_s)
@@ -276,12 +235,10 @@ p_cb   = cb_m.predict_proba(X_te_s)
 p_et   = et_m.predict_proba(X_te_s)
 p_lgb2 = lgb_m2.predict_proba(X_te_s)
 
-# Soft vote — proba arrays are already 3-class; argmax + shift to 1-based
-classes = lgb_m.classes_   # [1, 2, 3]
-soft_proba   = (p_lgb + p_cb + p_et + p_lgb2) / 4
-wtd_proba    = (2*p_lgb + p_cb + p_et + 2*p_lgb2) / 6
-soft_pred    = classes[np.argmax(soft_proba, axis=1)]
-wtd_pred     = classes[np.argmax(wtd_proba,  axis=1)]
+soft_proba = (p_lgb + p_cb + p_et + p_lgb2) / 4
+wtd_proba  = (2*p_lgb + p_cb + p_et + 2*p_lgb2) / 6
+soft_pred  = lgb_m.classes_[np.argmax(soft_proba, axis=1)]
+wtd_pred   = lgb_m.classes_[np.argmax(wtd_proba,  axis=1)]
 
 def ev(p): return accuracy_score(y_te, p), f1_score(y_te, p, average="weighted")
 
@@ -294,7 +251,7 @@ all_res = {
     "Wtd Vote":   (wtd_pred,  *ev(wtd_pred)),
 }
 
-print("\n" + "="*55 + "\nFINAL RESULTS (3-class)\n" + "="*55)
+print("\n" + "="*55 + "\nFINAL RESULTS\n" + "="*55)
 best_name, best_acc, best_pred = None, 0, None
 for mn, (pred, acc, f1) in all_res.items():
     tag = " ◄" if acc == max(r[1] for r in all_res.values()) else ""
@@ -302,36 +259,41 @@ for mn, (pred, acc, f1) in all_res.items():
     if acc > best_acc:
         best_acc, best_name, best_pred = acc, mn, pred
 
-print(f"\nBest: {best_name}  Acc={best_acc:.4f} ({best_acc*100:.2f}%)")
+# Decode back to G/F/P strings for reporting
+def decode(arr): return le.inverse_transform(arr)
+
+print(f"\nBest model: {best_name}  Acc={best_acc:.4f} ({best_acc*100:.2f}%)")
 print("\nClassification Report:")
-labels = [LABEL_MAP3[i] for i in sorted(LABEL_MAP3)]
-print(classification_report(y_te, best_pred, target_names=labels))
+class_order = [0, 1, 2]
+class_names = [LABEL_MAP[le.classes_[i]] for i in class_order]
+print(classification_report(y_te, best_pred, labels=class_order,
+                             target_names=class_names))
 
 print("\nTop 15 features by MI:")
 for i, (f, v) in enumerate(mi_s.head(15).items()):
     print(f"  {i+1:2d}. {f:<40} {v:.4f}")
 
-# ── Visualizations ────────────────────────────────────────────────────────────
+# ── 12. Visualizations ────────────────────────────────────────────────────────
 fi_s = pd.Series(lgb_m.feature_importances_, index=sel).sort_values(ascending=False)
-PALETTE = {"Good/Excellent": "#4CAF50", "Fair": "#FF9800", "Poor/Failing": "#F44336"}
-CLASS_COLORS = [PALETTE[LABEL_MAP3[i]] for i in sorted(LABEL_MAP3)]
+colors3 = [PALETTE["Good"], PALETTE["Fair"], PALETTE["Poor"]]  # G, F, P
 
 fig = plt.figure(figsize=(22, 26))
-fig.suptitle("Bridge/Dam Condition — 3-Class Classification Pipeline",
+fig.suptitle("Bridge Condition — 3-Class Classification Report\n"
+             "G (Good) | F (Fair) | P (Poor)",
              fontsize=17, fontweight="bold", y=0.99)
-gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.52, wspace=0.42)
+gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.52, wspace=0.44)
 
-# (a) Class distribution (3-class)
+# (a) Class distribution
 ax0 = fig.add_subplot(gs[0, 0])
-counts = y.value_counts().sort_index()
-clrs = [PALETTE[LABEL_MAP3[i]] for i in counts.index]
-bars = ax0.bar([LABEL_MAP3[i] for i in counts.index], counts.values,
-               color=clrs, edgecolor="white", linewidth=0.5)
+counts = y_raw.value_counts()[["G","F","P"]]
+bars = ax0.bar([LABEL_MAP[c] for c in counts.index], counts.values,
+               color=[PALETTE[LABEL_MAP[c]] for c in counts.index],
+               edgecolor="white", linewidth=0.5)
 for bar, val in zip(bars, counts.values):
-    ax0.text(bar.get_x()+bar.get_width()/2, bar.get_height()+10,
-             str(val), ha="center", va="bottom", fontsize=10, fontweight="bold")
-ax0.set_title("3-Class Distribution\n(merged Excellent+Good)", fontsize=11, fontweight="bold")
-ax0.set_ylabel("Count"); ax0.tick_params(axis="x", rotation=10)
+    ax0.text(bar.get_x()+bar.get_width()/2, bar.get_height()+5,
+             str(val), ha="center", va="bottom", fontsize=11, fontweight="bold")
+ax0.set_title("Class Distribution", fontsize=12, fontweight="bold")
+ax0.set_ylabel("Count")
 
 # (b) Model comparison
 ax1 = fig.add_subplot(gs[0, 1:])
@@ -343,11 +305,11 @@ b1 = ax1.bar(xp-w/2, accs, w, label="Accuracy",    color="#5C6BC0", alpha=0.87)
 b2 = ax1.bar(xp+w/2, f1s,  w, label="F1 Weighted", color="#26A69A", alpha=0.87)
 ax1.set_xticks(xp); ax1.set_xticklabels(names, fontsize=9)
 ax1.set_ylim(0, 1.08)
-ax1.axhline(0.95, color="red", ls="--", lw=1.8, label="95% target")
-ax1.set_title("Model Comparison — 3-Class (Optuna-tuned)", fontsize=12, fontweight="bold")
+ax1.axhline(0.90, color="red", ls="--", lw=1.5, label="90% target")
+ax1.set_title("Model Comparison (Optuna-tuned)", fontsize=12, fontweight="bold")
 ax1.set_ylabel("Score"); ax1.legend(fontsize=9)
 for b in [*b1, *b2]:
-    ax1.text(b.get_x()+b.get_width()/2, b.get_height()+0.005,
+    ax1.text(b.get_x()+b.get_width()/2, b.get_height()+0.004,
              f"{b.get_height():.3f}", ha="center", va="bottom", fontsize=8)
 
 # (c) Optuna convergence
@@ -361,26 +323,26 @@ ax2.set_xlabel("Trial"); ax2.set_ylabel("Best Val F1"); ax2.legend(fontsize=8)
 
 # (d) Confusion matrix
 ax3 = fig.add_subplot(gs[1, :2])
-cm_arr = confusion_matrix(y_te, best_pred, labels=sorted(LABEL_MAP3))
+cm_arr = confusion_matrix(y_te, best_pred, labels=class_order)
 cm_pct = cm_arr.astype(float) / cm_arr.sum(axis=1, keepdims=True) * 100
 sns.heatmap(cm_pct, annot=True, fmt=".1f", cmap="Blues",
-            xticklabels=labels, yticklabels=labels,
+            xticklabels=class_names, yticklabels=class_names,
             ax=ax3, linewidths=0.5, cbar_kws={"label": "%"})
 for i in range(3):
     for j in range(3):
-        ax3.text(j+0.5, i+0.72, f"n={cm_arr[i,j]}", ha="center", fontsize=7, color="gray")
+        ax3.text(j+0.5, i+0.72, f"n={cm_arr[i,j]}", ha="center", fontsize=8, color="gray")
 ax3.set_title(f"Confusion Matrix — {best_name}", fontsize=12, fontweight="bold")
 ax3.set_xlabel("Predicted"); ax3.set_ylabel("Actual")
 
-# (e) Top-20 LGB feature importance
+# (e) LGB feature importance (top 20)
 ax4 = fig.add_subplot(gs[2, :2])
 top20 = fi_s.head(20)
 ax4.barh(range(20), top20.values[::-1], color="#7E57C2", alpha=0.85)
 ax4.set_yticks(range(20)); ax4.set_yticklabels(top20.index[::-1], fontsize=8)
-ax4.set_title("Top 20 Features by LGB Importance", fontsize=12, fontweight="bold")
+ax4.set_title("Top 20 Feature Importances (LightGBM)", fontsize=12, fontweight="bold")
 ax4.set_xlabel("Importance")
 
-# (f) Top MI features
+# (f) MI scores (top 20)
 ax5 = fig.add_subplot(gs[2, 2])
 top_mi = mi_s.head(20)
 ax5.barh(range(20), top_mi.values[::-1], color="#42A5F5", alpha=0.85)
@@ -390,25 +352,25 @@ ax5.set_xlabel("MI Score")
 
 # (g) Per-class P/R/F1
 ax6 = fig.add_subplot(gs[3, :2])
-prec, rec, f1pc, supp = precision_recall_fscore_support(y_te, best_pred,
-                                                          labels=sorted(LABEL_MAP3))
+prec, rec, f1pc, supp = precision_recall_fscore_support(
+    y_te, best_pred, labels=class_order)
 xp2 = np.arange(3); w2 = 0.25
-lnames = [f"{LABEL_MAP3[i]}\n(n={s})" for i, s in zip(sorted(LABEL_MAP3), supp)]
+lnames = [f"{cn}\n(n={s})" for cn, s in zip(class_names, supp)]
 for off, vals, lbl, col in [(-w2, prec, "Precision", "#5C6BC0"),
-                              (0,  rec,  "Recall",    "#26A69A"),
-                              (w2, f1pc, "F1",        "#FFA726")]:
+                              (0,   rec,  "Recall",    "#26A69A"),
+                              (w2,  f1pc, "F1",        "#FFA726")]:
     bars2 = ax6.bar(xp2+off, vals, w2, label=lbl, color=col, alpha=0.85)
     for b, v in zip(bars2, vals):
         ax6.text(b.get_x()+b.get_width()/2, v+0.01, f"{v:.2f}",
-                 ha="center", fontsize=8)
-ax6.set_xticks(xp2); ax6.set_xticklabels(lnames, fontsize=10)
-ax6.set_ylim(0, 1.15)
+                 ha="center", fontsize=9)
+ax6.set_xticks(xp2); ax6.set_xticklabels(lnames, fontsize=11)
+ax6.set_ylim(0, 1.18)
 ax6.set_title(f"Per-Class Metrics — {best_name}", fontsize=12, fontweight="bold")
 ax6.legend(fontsize=9); ax6.set_ylabel("Score")
 
-# (h) Confidence histogram
+# (h) Soft-vote confidence
 ax7 = fig.add_subplot(gs[3, 2])
-avg_p = soft_proba; maxp = avg_p.max(axis=1)
+maxp = soft_proba.max(axis=1)
 ok = (soft_pred == y_te.values)
 ax7.hist(maxp[ok],  bins=25, alpha=0.65, color="#4CAF50",
          label=f"Correct ({ok.sum()})")
@@ -422,8 +384,8 @@ plt.savefig(OUT, dpi=150, bbox_inches="tight")
 print(f"\nReport saved → {OUT}")
 
 print("\n" + "="*55)
-print(f"Classes       : 3  (Good/Excellent | Fair | Poor/Failing)")
-print(f"Features      : {len(feat_cols)} engineered → {len(sel)} MI-selected")
-print(f"Optuna trials : LGB=25  CB=15  ET=15  LGB2=20")
+print(f"Dataset       : {df.shape[0]} bridges, {len(feat_cols)} features → {len(sel)} MI-selected")
+print(f"Classes       : Good | Fair | Poor  (SMOTE-balanced)")
+print(f"Optuna trials : LGB=30  CB=20  ET=20  LGB2=25")
 print(f"Best model    : {best_name}  Acc={best_acc:.4f}  ({best_acc*100:.2f}%)")
 print("=" * 55)
