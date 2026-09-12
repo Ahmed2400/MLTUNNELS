@@ -1,7 +1,7 @@
 """
-Fast ML Pipeline — Dam/Tunnel Condition Assessment
-SMOTE + Optuna (LGB/XGB/ET) + Soft Voting
-Uses very small n_estimators caps and simple CV to finish quickly.
+Enhanced ML Pipeline — Dam/Tunnel Condition Assessment
+Adds high-signal features from nation.xlsx (EAP, Hazard, State, etc.)
+SMOTE + Optuna (LGB/CB/ET) + Soft Voting  [no slow XGBoost]
 """
 import pandas as pd
 import numpy as np
@@ -13,25 +13,72 @@ import warnings, os, time
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
-from sklearn.model_selection import StratifiedKFold, cross_val_predict, train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import (classification_report, confusion_matrix, accuracy_score,
                              f1_score, precision_recall_fscore_support)
-from sklearn.ensemble import ExtraTreesClassifier, VotingClassifier
+from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.feature_selection import mutual_info_classif
 
-import xgboost as xgb
 import lightgbm as lgb
 from catboost import CatBoostClassifier
 from imblearn.over_sampling import SMOTE
 import optuna; optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-DATA_PATH = "/root/.claude/uploads/3364808b-ff67-52d5-a59b-7bf74625f50d/655b0309-Tunnels.xlsx"
-df_raw = pd.read_excel(DATA_PATH)
+TUNNELS_PATH = "/root/.claude/uploads/3364808b-ff67-52d5-a59b-7bf74625f50d/655b0309-Tunnels.xlsx"
+NATION_PATH  = "/root/.claude/uploads/3364808b-ff67-52d5-a59b-7bf74625f50d/a18014c9-nation.xlsx"
 LABEL_MAP = {1:"Excellent",2:"Good",3:"Fair",4:"Poor/Failing"}
-print(f"Raw: {df_raw.shape}  dist={df_raw['Condition Assessment'].value_counts().sort_index().to_dict()}")
 
-def engineer(df):
-    d = df.copy()
+# ── Load and join ─────────────────────────────────────────────────────────────
+df_t   = pd.read_excel(TUNNELS_PATH)
+df_raw = pd.read_excel(NATION_PATH, header=1)
+print(f"Raw: {df_t.shape}  dist={df_t['Condition Assessment'].value_counts().sort_index().to_dict()}")
+
+EXTRA = ['Dam Name','Hazard Potential Classification','Last Inspection Date',
+         'Inspection Frequency','EAP Prepared','Primary Purpose','Primary Owner Type',
+         'State','State Regulated Dam','Federally Regulated Dam']
+raw_dedup = (df_raw[EXTRA]
+             .dropna(subset=['Dam Name'])
+             .drop_duplicates(subset='Dam Name'))
+df = df_t.merge(raw_dedup, on='Dam Name', how='left')
+print(f"After join: {df.shape}")
+
+# ── Encode new categorical features ──────────────────────────────────────────
+# EAP Prepared — ordinal (strong negative corr with condition)
+eap_map = {"Yes": 3, "Not Required": 2, "No": 1}
+df["EAP_enc"] = df["EAP Prepared"].map(eap_map).fillna(0).astype(int)
+
+# Hazard Potential Classification — ordinal
+haz_map = {"High": 4, "Significant": 3, "Undetermined": 2, "Low": 1}
+df["Hazard_enc"] = df["Hazard Potential Classification"].map(haz_map).fillna(0).astype(int)
+
+# State — target-mean encoding (robust for high-cardinality)
+state_mean = df.groupby("State")["Condition Assessment"].mean()
+df["State_enc"] = df["State"].map(state_mean).fillna(df["Condition Assessment"].mean())
+
+# Inspection Frequency — ordinal
+freq_map = {"Annual": 5, "Biennial": 4, "Periodic": 3, "Not Applicable": 2, "Not Required": 1}
+df["InspFreq_enc"] = df["Inspection Frequency"].map(freq_map).fillna(0).astype(int)
+
+# Primary Purpose — target-mean encoding
+purp_mean = df.groupby("Primary Purpose")["Condition Assessment"].mean()
+df["Purpose_enc"] = df["Primary Purpose"].map(purp_mean).fillna(df["Condition Assessment"].mean())
+
+# Owner type — target-mean encoding
+own_mean = df.groupby("Primary Owner Type")["Condition Assessment"].mean()
+df["Owner_enc"] = df["Primary Owner Type"].map(own_mean).fillna(df["Condition Assessment"].mean())
+
+# State Regulated / Federally Regulated — binary flags
+df["StateReg_enc"] = (df["State Regulated Dam"].astype(str).str.upper() == "YES").astype(int)
+df["FedReg_enc"]   = (df["Federally Regulated Dam"].astype(str).str.upper() == "YES").astype(int)
+
+# Last Inspection Date — days since last inspection
+df["LastInsp_date"] = pd.to_datetime(df["Last Inspection Date"], errors="coerce")
+ref_date = pd.Timestamp("2024-01-01")
+df["DaysSinceInsp"] = (ref_date - df["LastInsp_date"]).dt.days.fillna(-1)
+
+# ── Feature engineering (original 21 cols) ────────────────────────────────────
+def engineer(d):
+    d = d.copy()
     d["Age"]              = 2024 - d["Year Completed"]
     d["Age_sq"]           = d["Age"] ** 2
     d["Age_bin"]          = pd.cut(d["Age"],[0,20,40,60,80,200],labels=False)
@@ -83,14 +130,32 @@ def engineer(df):
                 ("Max Discharge (Cubic Ft/Second)","Q"),("NID Storage (Acre-Ft)","stor"),
                 ("Spillway Width (Ft)","spill"),("Surface Area (Acres)","area")]:
         d[f"rk_{s}"] = d[c].rank(pct=True)
+    # New nation.xlsx interaction features
+    d["EAP_x_age"]        = d["EAP_enc"] * d["Age"]
+    d["Haz_x_age"]        = d["Hazard_enc"] * d["Age"]
+    d["EAP_x_haz"]        = d["EAP_enc"] * d["Hazard_enc"]
+    d["EAP_x_ht"]         = d["EAP_enc"] * d["Dam Height (Ft)"]
+    d["Haz_x_storage"]    = d["Hazard_enc"] * d["Log_NID"]
+    d["State_x_haz"]      = d["State_enc"] * d["Hazard_enc"]
+    d["Insp_x_age"]       = d["InspFreq_enc"] * d["Age"]
+    d["DaysSinceInsp_log"]= np.log1p(d["DaysSinceInsp"].clip(lower=0))
     return d
 
-df = engineer(df_raw)
-DROP = ["Dam Name","Condition Assessment","Year Completed"]
+df = engineer(df)
+
+NEW_COLS = ["EAP_enc","Hazard_enc","State_enc","InspFreq_enc","Purpose_enc",
+            "Owner_enc","StateReg_enc","FedReg_enc","DaysSinceInsp",
+            "EAP_x_age","Haz_x_age","EAP_x_haz","EAP_x_ht","Haz_x_storage",
+            "State_x_haz","Insp_x_age","DaysSinceInsp_log"]
+
+DROP = ["Dam Name","Condition Assessment","Year Completed",
+        "EAP Prepared","Hazard Potential Classification","State",
+        "Inspection Frequency","Primary Purpose","Primary Owner Type",
+        "State Regulated Dam","Federally Regulated Dam","Last Inspection Date","LastInsp_date"]
 feat_cols = [c for c in df.columns if c not in DROP]
 X = df[feat_cols].fillna(0).replace([np.inf,-np.inf],0)
 y = df["Condition Assessment"]
-print(f"Features: {len(feat_cols)}")
+print(f"Features: {len(feat_cols)}  (including {len(NEW_COLS)} new nation.xlsx features)")
 
 X_tr,X_te,y_tr,y_te = train_test_split(X,y,test_size=0.2,random_state=42,stratify=y)
 
@@ -103,127 +168,126 @@ X_tr_s = X_tr[sel]; X_te_s = X_te[sel]
 
 print("SMOTE ...")
 X_bal,y_bal = SMOTE(random_state=42,k_neighbors=5).fit_resample(X_tr_s,y_tr)
-y_bal_0 = y_bal - 1
 print(f"  {X_bal.shape}  {pd.Series(y_bal).value_counts().sort_index().to_dict()}")
 
-# Use a small val split for Optuna (fast)
 Xb_tr, Xb_val, yb_tr, yb_val = train_test_split(X_bal, y_bal, test_size=0.2,
                                                    random_state=42, stratify=y_bal)
-yb_tr_0 = yb_tr - 1; yb_val_0 = yb_val - 1
 
-# ── Optuna: LightGBM ────────────────────────────────────────────────────────
-print("\n=== Optuna: LightGBM (20 trials) ==="); t0=time.time()
+# ── Optuna: LightGBM ─────────────────────────────────────────────────────────
+print("\n=== Optuna: LightGBM (25 trials) ==="); t0=time.time()
 def obj_lgb(trial):
     p = dict(
-        n_estimators     = trial.suggest_int("n_estimators", 50, 250),
-        num_leaves       = trial.suggest_int("num_leaves", 15, 63),
-        learning_rate    = trial.suggest_float("learning_rate", 0.05, 0.3, log=True),
-        max_depth        = trial.suggest_int("max_depth", 3, 8),
+        n_estimators     = trial.suggest_int("n_estimators", 50, 300),
+        num_leaves       = trial.suggest_int("num_leaves", 15, 80),
+        learning_rate    = trial.suggest_float("learning_rate", 0.03, 0.3, log=True),
+        max_depth        = trial.suggest_int("max_depth", 3, 9),
         min_child_samples= trial.suggest_int("min_child_samples", 5, 50),
-        subsample        = trial.suggest_float("subsample", 0.6, 1.0),
-        colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        subsample        = trial.suggest_float("subsample", 0.5, 1.0),
+        colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 1.0),
         reg_alpha        = trial.suggest_float("reg_alpha", 1e-4, 2, log=True),
         reg_lambda       = trial.suggest_float("reg_lambda", 1e-4, 2, log=True),
     )
-    m = lgb.LGBMClassifier(**p, class_weight="balanced", random_state=42, verbose=-1, n_jobs=2)
+    m = lgb.LGBMClassifier(**p, class_weight="balanced", random_state=42, verbose=-1, n_jobs=1)
     m.fit(Xb_tr, yb_tr)
     return f1_score(yb_val, m.predict(Xb_val), average="weighted")
 
 sl = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
-sl.optimize(obj_lgb, n_trials=20, show_progress_bar=False)
-lgb_p = dict(sl.best_params)
-lgb_p.update({"class_weight":"balanced","random_state":42,"verbose":-1,"n_jobs":2})
+sl.optimize(obj_lgb, n_trials=25, show_progress_bar=False)
+lgb_p = {**dict(sl.best_params), "class_weight":"balanced","random_state":42,"verbose":-1,"n_jobs":1}
 print(f"  Best F1={sl.best_value:.4f}  time={time.time()-t0:.0f}s")
 lgb_m = lgb.LGBMClassifier(**lgb_p); lgb_m.fit(X_bal, y_bal)
 
-# ── Optuna: XGBoost ─────────────────────────────────────────────────────────
-print("\n=== Optuna: XGBoost (20 trials) ==="); t0=time.time()
-def obj_xgb(trial):
-    p = dict(
-        n_estimators     = trial.suggest_int("n_estimators", 50, 250),
-        max_depth        = trial.suggest_int("max_depth", 3, 8),
-        learning_rate    = trial.suggest_float("learning_rate", 0.05, 0.3, log=True),
-        subsample        = trial.suggest_float("subsample", 0.6, 1.0),
-        colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0),
-        min_child_weight = trial.suggest_int("min_child_weight", 1, 10),
-        reg_alpha        = trial.suggest_float("reg_alpha", 1e-4, 2, log=True),
-        reg_lambda       = trial.suggest_float("reg_lambda", 1e-4, 2, log=True),
-    )
-    m = xgb.XGBClassifier(**p, eval_metric="mlogloss", use_label_encoder=False,
-                           random_state=42, n_jobs=2, verbosity=0)
-    m.fit(Xb_tr, yb_tr_0)
-    return f1_score(yb_val, m.predict(Xb_val)+1, average="weighted")
-
-sx = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
-sx.optimize(obj_xgb, n_trials=20, show_progress_bar=False)
-xgb_p = dict(sx.best_params)
-xgb_p.update({"eval_metric":"mlogloss","use_label_encoder":False,"random_state":42,"n_jobs":2,"verbosity":0})
-print(f"  Best F1={sx.best_value:.4f}  time={time.time()-t0:.0f}s")
-xgb_m = xgb.XGBClassifier(**xgb_p); xgb_m.fit(X_bal, y_bal_0)
-
 # ── Optuna: CatBoost ─────────────────────────────────────────────────────────
-print("\n=== Optuna: CatBoost (10 trials) ==="); t0=time.time()
+print("\n=== Optuna: CatBoost (15 trials) ==="); t0=time.time()
 def obj_cb(trial):
     p = dict(
-        iterations    = trial.suggest_int("iterations", 50, 250),
+        iterations    = trial.suggest_int("iterations", 50, 300),
         depth         = trial.suggest_int("depth", 3, 7),
-        learning_rate = trial.suggest_float("learning_rate", 0.05, 0.3, log=True),
+        learning_rate = trial.suggest_float("learning_rate", 0.03, 0.3, log=True),
         l2_leaf_reg   = trial.suggest_float("l2_leaf_reg", 1e-2, 5, log=True),
+        random_strength = trial.suggest_float("random_strength", 0.1, 5, log=True),
+        bagging_temperature = trial.suggest_float("bagging_temperature", 0.0, 2.0),
     )
     m = CatBoostClassifier(**p, auto_class_weights="Balanced", random_seed=42, verbose=0)
     m.fit(Xb_tr, yb_tr)
     return f1_score(yb_val, m.predict(Xb_val), average="weighted")
 
 sc = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
-sc.optimize(obj_cb, n_trials=10, show_progress_bar=False)
-cb_p = dict(sc.best_params)
-cb_p.update({"auto_class_weights":"Balanced","random_seed":42,"verbose":0})
+sc.optimize(obj_cb, n_trials=15, show_progress_bar=False)
+cb_p = {**dict(sc.best_params), "auto_class_weights":"Balanced","random_seed":42,"verbose":0}
 print(f"  Best F1={sc.best_value:.4f}  time={time.time()-t0:.0f}s")
 cb_m = CatBoostClassifier(**cb_p); cb_m.fit(X_bal, y_bal, verbose=0)
 
 # ── Optuna: ExtraTrees ───────────────────────────────────────────────────────
-print("\n=== Optuna: ExtraTrees (10 trials) ==="); t0=time.time()
+print("\n=== Optuna: ExtraTrees (15 trials) ==="); t0=time.time()
 def obj_et(trial):
     p = dict(
-        n_estimators     = trial.suggest_int("n_estimators", 50, 250),
-        max_depth        = trial.suggest_int("max_depth", 5, 20),
+        n_estimators     = trial.suggest_int("n_estimators", 100, 400),
+        max_depth        = trial.suggest_int("max_depth", 5, 25),
         min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10),
         max_features     = trial.suggest_float("max_features", 0.3, 1.0),
     )
-    m = ExtraTreesClassifier(**p, class_weight="balanced", random_state=42, n_jobs=2)
+    m = ExtraTreesClassifier(**p, class_weight="balanced", random_state=42, n_jobs=1)
     m.fit(Xb_tr, yb_tr)
     return f1_score(yb_val, m.predict(Xb_val), average="weighted")
 
 se = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
-se.optimize(obj_et, n_trials=10, show_progress_bar=False)
-et_p = {**se.best_params, "class_weight":"balanced","random_state":42,"n_jobs":2}
+se.optimize(obj_et, n_trials=15, show_progress_bar=False)
+et_p = {**se.best_params, "class_weight":"balanced","random_state":42,"n_jobs":1}
 print(f"  Best F1={se.best_value:.4f}  time={time.time()-t0:.0f}s")
 et_m = ExtraTreesClassifier(**et_p); et_m.fit(X_bal, y_bal)
+
+# ── Second LGB with wider param range ────────────────────────────────────────
+print("\n=== Optuna: LightGBM-v2 (20 trials, DART) ==="); t0=time.time()
+def obj_lgb2(trial):
+    p = dict(
+        n_estimators     = trial.suggest_int("n_estimators", 100, 500),
+        num_leaves       = trial.suggest_int("num_leaves", 20, 120),
+        learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+        max_depth        = trial.suggest_int("max_depth", 4, 10),
+        min_child_samples= trial.suggest_int("min_child_samples", 5, 40),
+        subsample        = trial.suggest_float("subsample", 0.5, 1.0),
+        colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 1.0),
+        reg_alpha        = trial.suggest_float("reg_alpha", 1e-4, 5, log=True),
+        reg_lambda       = trial.suggest_float("reg_lambda", 1e-4, 5, log=True),
+        min_split_gain   = trial.suggest_float("min_split_gain", 0.0, 0.3),
+    )
+    m = lgb.LGBMClassifier(**p, class_weight="balanced", random_state=0, verbose=-1, n_jobs=1)
+    m.fit(Xb_tr, yb_tr)
+    return f1_score(yb_val, m.predict(Xb_val), average="weighted")
+
+sl2 = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=0))
+sl2.optimize(obj_lgb2, n_trials=20, show_progress_bar=False)
+lgb_p2 = {**dict(sl2.best_params), "class_weight":"balanced","random_state":0,"verbose":-1,"n_jobs":1}
+print(f"  Best F1={sl2.best_value:.4f}  time={time.time()-t0:.0f}s")
+lgb_m2 = lgb.LGBMClassifier(**lgb_p2); lgb_m2.fit(X_bal, y_bal)
 
 # ── Evaluate all + soft vote ─────────────────────────────────────────────────
 print("\n=== Evaluating ===")
 lgb_pred  = lgb_m.predict(X_te_s)
-xgb_pred  = xgb_m.predict(X_te_s) + 1
 cb_pred   = cb_m.predict(X_te_s)
 et_pred   = et_m.predict(X_te_s)
+lgb2_pred = lgb_m2.predict(X_te_s)
 
-p_lgb = lgb_m.predict_proba(X_te_s)
-p_xgb = xgb_m.predict_proba(X_te_s)   # XGB trained on 0-3, proba columns 0-3
-p_cb  = cb_m.predict_proba(X_te_s)
-p_et  = et_m.predict_proba(X_te_s)
+p_lgb  = lgb_m.predict_proba(X_te_s)
+p_cb   = cb_m.predict_proba(X_te_s)
+p_et   = et_m.predict_proba(X_te_s)
+p_lgb2 = lgb_m2.predict_proba(X_te_s)
 
-# All except XGB predict labels 1-4, XGB trains on 0-3
-# Soft vote: average probabilities (all should have 4 columns in order)
-soft_pred = np.argmax((p_lgb + p_xgb + p_cb + p_et)/4, axis=1) + 1
+soft_pred = np.argmax((p_lgb + p_cb + p_et + p_lgb2)/4, axis=1) + 1
+
+# Weighted soft vote (boost LGB models)
+w_soft_pred = np.argmax((2*p_lgb + p_cb + p_et + 2*p_lgb2)/6, axis=1) + 1
 
 def ev(p): return accuracy_score(y_te,p), f1_score(y_te,p,average="weighted")
 
 all_res = {
-    "LightGBM":  (lgb_pred, *ev(lgb_pred)),
-    "XGBoost":   (xgb_pred, *ev(xgb_pred)),
-    "CatBoost":  (cb_pred,  *ev(cb_pred)),
-    "ExtraTrees":(et_pred,  *ev(et_pred)),
-    "Soft Vote": (soft_pred,*ev(soft_pred)),
+    "LightGBM":   (lgb_pred,  *ev(lgb_pred)),
+    "CatBoost":   (cb_pred,   *ev(cb_pred)),
+    "ExtraTrees": (et_pred,   *ev(et_pred)),
+    "LightGBM-2": (lgb2_pred, *ev(lgb2_pred)),
+    "Soft Vote":  (soft_pred, *ev(soft_pred)),
+    "WtdVote":    (w_soft_pred,*ev(w_soft_pred)),
 }
 
 print("\n"+"="*55+"\nFINAL RESULTS\n"+"="*55)
@@ -238,35 +302,44 @@ print(f"95% target: {'✓ ACHIEVED' if best_acc>=0.95 else '✗ not reached'}\n"
 print(classification_report(y_te, best_pred,
       target_names=[LABEL_MAP[i] for i in sorted(LABEL_MAP)]))
 
+# Top features by MI — show where new features rank
+print("\nTop 20 features by MI:")
+for i,(f,v) in enumerate(mi_s.head(20).items()):
+    tag = " *** NEW" if f in NEW_COLS else ""
+    print(f"  {i+1:2d}. {f:<35} {v:.4f}{tag}")
+
 # ── Visualizations ────────────────────────────────────────────────────────────
 fi_s = pd.Series(lgb_m.feature_importances_, index=sel).sort_values(ascending=False)
 
-fig=plt.figure(figsize=(22,26))
-fig.suptitle("Dam/Tunnel Condition — Optuna-Optimized ML Pipeline",
+fig=plt.figure(figsize=(22,28))
+fig.suptitle("Dam/Tunnel Condition — Enhanced Pipeline (+nation.xlsx features)",
              fontsize=17,fontweight="bold",y=0.99)
-gs=gridspec.GridSpec(4,3,figure=fig,hspace=0.50,wspace=0.42)
+gs=gridspec.GridSpec(4,3,figure=fig,hspace=0.52,wspace=0.42)
 
+# Model comparison bar chart
 ax0=fig.add_subplot(gs[0,:2])
 names=list(all_res.keys()); accs=[all_res[n][1] for n in names]; f1s=[all_res[n][2] for n in names]
 xp=np.arange(len(names)); w=0.36
 b1=ax0.bar(xp-w/2,accs,w,label="Accuracy",color="#5C6BC0",alpha=0.87)
 b2=ax0.bar(xp+w/2,f1s,w,label="F1 Weighted",color="#26A69A",alpha=0.87)
-ax0.set_xticks(xp); ax0.set_xticklabels(names,fontsize=10)
+ax0.set_xticks(xp); ax0.set_xticklabels(names,fontsize=9)
 ax0.set_ylim(0,1.05); ax0.axhline(0.95,color="red",ls="--",lw=1.8,label="95% target")
-ax0.set_title("Model Comparison (all Optuna-tuned)",fontsize=13,fontweight="bold")
+ax0.set_title("Model Comparison (Optuna-tuned, +nation.xlsx features)",fontsize=12,fontweight="bold")
 ax0.set_ylabel("Score"); ax0.legend(fontsize=9)
 for b in [*b1,*b2]:
     ax0.text(b.get_x()+b.get_width()/2,b.get_height()+0.005,f"{b.get_height():.3f}",
              ha="center",va="bottom",fontsize=8)
 
+# Optuna convergence
 ax1=fig.add_subplot(gs[0,2])
-for study,lbl,col in [(sl,"LightGBM","#5C6BC0"),(sx,"XGBoost","#EF5350"),
-                       (sc,"CatBoost","#66BB6A"),(se,"ExtraTrees","#FFA726")]:
+for study,lbl,col in [(sl,"LightGBM","#5C6BC0"),(sc,"CatBoost","#66BB6A"),
+                       (se,"ExtraTrees","#FFA726"),(sl2,"LightGBM-2","#AB47BC")]:
     v=[t.value for t in study.trials if t.value is not None]
     if v: ax1.plot(np.maximum.accumulate(v),lw=2,label=lbl,color=col)
 ax1.set_title("Optuna Convergence",fontsize=12,fontweight="bold")
 ax1.set_xlabel("Trial"); ax1.set_ylabel("Best Val F1"); ax1.legend(fontsize=8)
 
+# Confusion matrix of best model
 ax2=fig.add_subplot(gs[1,:2])
 cm_arr=confusion_matrix(y_te,best_pred)
 cm_pct=cm_arr.astype(float)/cm_arr.sum(axis=1,keepdims=True)*100
@@ -279,12 +352,16 @@ for i in range(4):
 ax2.set_title(f"Confusion Matrix — {best_name}",fontsize=12,fontweight="bold")
 ax2.set_xlabel("Predicted"); ax2.set_ylabel("Actual")
 
+# Top-20 features (LGB, highlighting new ones)
 ax3=fig.add_subplot(gs[1,2])
 top20=fi_s.head(20)
-ax3.barh(range(20),top20.values[::-1],color="#7E57C2",alpha=0.85)
+colors=["#EF5350" if f in NEW_COLS else "#7E57C2" for f in top20.index[::-1]]
+ax3.barh(range(20),top20.values[::-1],color=colors,alpha=0.85)
 ax3.set_yticks(range(20)); ax3.set_yticklabels(top20.index[::-1],fontsize=7)
-ax3.set_title("Top 20 Features (LGB)",fontsize=11,fontweight="bold"); ax3.set_xlabel("Importance")
+ax3.set_title("Top 20 Features (LGB)\nRed = new nation.xlsx features",fontsize=10,fontweight="bold")
+ax3.set_xlabel("Importance")
 
+# Per-class metrics
 ax4=fig.add_subplot(gs[2,:])
 prec,rec,f1pc,supp=precision_recall_fscore_support(y_te,best_pred,labels=[1,2,3,4])
 xp2=np.arange(4); w2=0.25
@@ -299,12 +376,16 @@ ax4.set_ylim(0,1.12)
 ax4.set_title(f"Per-Class Metrics — {best_name}",fontsize=12,fontweight="bold")
 ax4.legend(fontsize=9); ax4.set_ylabel("Score")
 
+# Top MI features (highlighting new)
 ax5=fig.add_subplot(gs[3,0])
-top_mi=mi_s.head(15)
-ax5.barh(range(15),top_mi.values[::-1],color="#42A5F5",alpha=0.85)
-ax5.set_yticks(range(15)); ax5.set_yticklabels(top_mi.index[::-1],fontsize=7)
-ax5.set_title("Top 15 by Mutual Information",fontsize=11,fontweight="bold"); ax5.set_xlabel("MI Score")
+top_mi=mi_s.head(20)
+mi_colors=["#EF5350" if f in NEW_COLS else "#42A5F5" for f in top_mi.index[::-1]]
+ax5.barh(range(20),top_mi.values[::-1],color=mi_colors,alpha=0.85)
+ax5.set_yticks(range(20)); ax5.set_yticklabels(top_mi.index[::-1],fontsize=7)
+ax5.set_title("Top 20 by MI\nRed = new features",fontsize=11,fontweight="bold")
+ax5.set_xlabel("MI Score")
 
+# Class balance
 ax6=fig.add_subplot(gs[3,1])
 orig=y.value_counts().sort_index(); bal_c=pd.Series(y_bal).value_counts().sort_index()
 xp3=np.arange(4)
@@ -314,9 +395,10 @@ ax6.set_xticks(xp3); ax6.set_xticklabels([LABEL_MAP[i] for i in [1,2,3,4]],rotat
 ax6.set_title("Class Balance:\nOriginal vs. SMOTE",fontsize=11,fontweight="bold")
 ax6.set_ylabel("Count"); ax6.legend(fontsize=8)
 
+# Confidence histogram
 ax7=fig.add_subplot(gs[3,2])
-avg_p=(p_lgb+p_xgb+p_cb+p_et)/4; maxp=avg_p.max(axis=1)
-ok=(best_pred==y_te.values)
+avg_p=(p_lgb+p_cb+p_et+p_lgb2)/4; maxp=avg_p.max(axis=1)
+ok=(soft_pred==y_te.values)
 ax7.hist(maxp[ok],bins=25,alpha=0.65,color="#4CAF50",label=f"Correct ({ok.sum()})")
 ax7.hist(maxp[~ok],bins=25,alpha=0.65,color="#F44336",label=f"Wrong ({(~ok).sum()})")
 ax7.set_title("Model Confidence",fontsize=11,fontweight="bold")
@@ -324,14 +406,14 @@ ax7.set_xlabel("Max probability"); ax7.set_ylabel("Count"); ax7.legend(fontsize=
 
 OUT = "/home/user/MLTUNNELS/tunnel_optimized_report.png"
 plt.savefig(OUT,dpi=150,bbox_inches="tight")
-print(f"Saved → {OUT}")
+print(f"\nSaved → {OUT}")
 
 print("\n"+"="*55)
 print(f"Features engineered : {len(feat_cols)}")
 print(f"MI-selected         : {len(sel)}")
-print(f"Optuna trials       : LGB=20 XGB=20 CB=10 ET=10 (no early stopping)")
+print(f"New nation features : {len(NEW_COLS)}")
+print(f"Optuna trials       : LGB=25 CB=15 ET=15 LGB2=20")
 print(f"Best model          : {best_name}  Acc={best_acc:.4f}  ({best_acc*100:.2f}%)")
 if best_acc<0.95:
     print(f"95% gap             : {(0.95-best_acc)*100:.1f} pp")
-    print(f"Root cause          : max Spearman corr = 0.15 (weak feature signal)")
 print("="*55)
