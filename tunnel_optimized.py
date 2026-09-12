@@ -427,7 +427,7 @@ print("="*55)
 # perfectly proportional — same class ratios as the dataset.
 # ═══════════════════════════════════════════════════════
 
-FINAL_TEST_FRAC = 0.10   # target test fraction of each class
+FINAL_TEST_FRAC = 0.15   # target test fraction of each class
 
 # Ensemble confidence on Phase-1 test set
 avg_proba  = (p_lgb + p_lgb2 + p_cb + p_et) / 4
