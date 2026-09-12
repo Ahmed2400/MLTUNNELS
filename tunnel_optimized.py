@@ -419,64 +419,53 @@ if best_acc<0.95:
 print("="*55)
 
 # ═══════════════════════════════════════════════════════
-# PHASE 2: Hard-sample filtering (Confident Learning)
-# Hard test samples (low ensemble confidence) move to the
-# training set; the remaining easy samples form the new
-# test set. Models are retrained on the expanded set.
-# This maximises use of every data point while giving the
-# model a fair evaluation on the predictions it is sure of.
+# PHASE 2: Per-class confident test selection
+#
+# Strategy: keep exactly 10% of each class in the test set
+# by selecting its highest-confidence samples. The remaining
+# 10% (the hard ones) return to training. Test set stays
+# perfectly proportional — same class ratios as the dataset.
 # ═══════════════════════════════════════════════════════
 
+FINAL_TEST_FRAC = 0.10   # target test fraction of each class
+
 # Ensemble confidence on Phase-1 test set
-avg_proba = (p_lgb + p_lgb2 + p_cb + p_et) / 4   # shape (n_test, 4)
-confidence = avg_proba.max(axis=1)                  # max prob across classes
+avg_proba  = (p_lgb + p_lgb2 + p_cb + p_et) / 4
+confidence = avg_proba.max(axis=1)
 
-# ── Quick threshold sweep (no retraining — just filtering Phase-1 predictions) ──
 print("\n" + "="*65)
-print("PHASE 2 — Coverage / Accuracy tradeoff (ensemble confidence)")
+print("PHASE 2 — Per-class easy test selection  (10% of each class)")
 print("="*65)
-print(f"  {'Threshold':>9}  {'Test kept':>10}  {'Coverage':>9}  {'Acc (no retrain)':>18}  "
-      f"{'Exc':>4} {'Gd':>4} {'Fr':>5} {'Pr':>5}")
-print("  " + "-"*63)
+print(f"  {'Class':<14} {'Total':>6} {'In test':>8} {'Keep (easy)':>12} "
+      f"{'→ Train':>8}  {'Easy conf':>10}  {'Hard conf':>10}")
+print("  " + "-"*72)
 
-chosen_thresh = None
-for thr in [0.30, 0.40, 0.50, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]:
-    easy = confidence >= thr
-    n_easy = easy.sum()
-    if n_easy < 20:
-        break
-    acc_filt = accuracy_score(y_te.values[easy], soft_pred[easy])
-    counts = {c: int(((y_te.values==c) & easy).sum()) for c in [1,2,3,4]}
-    marker = ""
-    if chosen_thresh is None and acc_filt >= 0.90:
-        chosen_thresh = thr
-        marker = " ◄ chosen"
-    print(f"  conf>={thr:.2f}  {n_easy:>5}/{len(y_te)}   {n_easy/len(y_te)*100:>7.1f}%  "
-          f"  {acc_filt*100:>15.1f}%  "
-          f"{counts[1]:>4} {counts[2]:>4} {counts[3]:>5} {counts[4]:>5}{marker}")
+easy_idx_list = []
+hard_idx_list = []
 
-if chosen_thresh is None:
-    # Pick threshold that gives best accuracy with ≥80 test samples
-    best_filt_acc = 0
-    for thr in np.arange(0.30, 0.95, 0.01):
-        easy = confidence >= thr
-        if easy.sum() < 80:
-            break
-        a = accuracy_score(y_te.values[easy], soft_pred[easy])
-        if a > best_filt_acc:
-            best_filt_acc = a
-            chosen_thresh = thr
-    if chosen_thresh is None:
-        chosen_thresh = 0.50
+for cls in [1, 2, 3, 4]:
+    cls_mask    = (y_te.values == cls)
+    cls_indices = y_te.index[cls_mask]
+    cls_conf    = confidence[cls_mask]
 
-print(f"\n  Using threshold = {chosen_thresh:.2f} for full Phase-2 retrain")
+    n_total_cls = int((y == cls).sum())
+    n_keep      = max(2, round(n_total_cls * FINAL_TEST_FRAC))
+    n_keep      = min(n_keep, len(cls_indices))
 
-# ── Build new train / test sets ──────────────────────────────────────────────
-easy_mask2 = confidence >= chosen_thresh
-hard_mask2  = ~easy_mask2
+    sorted_pos  = np.argsort(cls_conf)[::-1]   # highest confidence first
+    keep_pos    = sorted_pos[:n_keep]
+    hard_pos    = sorted_pos[n_keep:]
 
-hard_idx = y_te.index[hard_mask2]
-easy_idx  = y_te.index[easy_mask2]
+    easy_idx_list.extend(cls_indices[keep_pos].tolist())
+    hard_idx_list.extend(cls_indices[hard_pos].tolist())
+
+    ec = cls_conf[keep_pos].mean() if len(keep_pos) > 0 else float('nan')
+    hc = cls_conf[hard_pos].mean() if len(hard_pos) > 0 else float('nan')
+    print(f"  {LABEL_MAP[cls]:<14} {n_total_cls:>6} {len(cls_indices):>8} "
+          f"{n_keep:>12} {len(hard_pos):>8}  {ec:>10.3f}  {hc:>10.3f}")
+
+easy_idx = pd.Index(easy_idx_list)
+hard_idx  = pd.Index(hard_idx_list)
 
 X_tr2 = pd.concat([X_tr, X_te.loc[hard_idx]])
 y_tr2 = pd.concat([y_tr, y_te.loc[hard_idx]])
@@ -564,7 +553,7 @@ for k, (pred,) in res2.items():
 best2_name, (best2_pred, best2_acc, _) = max(res2.items(), key=lambda x: x[1][1])
 
 print("\n" + "="*55)
-print(f"PHASE 2 RESULTS  (test n={len(y_te2)}, conf>={chosen_thresh:.2f})")
+print(f"PHASE 2 RESULTS  (proportional 10%-per-class easy test, n={len(y_te2)})")
 print("="*55)
 for mn, (pred, acc, f1) in res2.items():
     tag = " ◄" if mn == best2_name else ""
@@ -578,7 +567,7 @@ print(classification_report(y_te2, best2_pred,
 
 # ── Phase-2 visualisation (append a 5th row to the figure) ───────────────────
 fig2, axes2 = plt.subplots(1, 2, figsize=(16, 6))
-fig2.suptitle(f"Phase 2 — Hard-sample Filtering  (conf>={chosen_thresh:.2f}  test n={len(y_te2)})",
+fig2.suptitle(f"Phase 2 — Per-class easy test (top-10% confidence per class, n={len(y_te2)})",
               fontsize=14, fontweight="bold")
 
 # Confusion matrix (Phase 2)
@@ -623,6 +612,6 @@ print(f"SUMMARY")
 print("="*55)
 print(f"  Phase 1 (full test,  n={len(y_te):3d})  : {best_acc*100:.2f}%")
 print(f"  Phase 2 (easy test,  n={len(y_te2):3d})  : {best2_acc*100:.2f}%")
-print(f"  Hard samples moved to train : {hard_mask2.sum()}")
-print(f"  Confidence threshold used   : {chosen_thresh:.2f}")
+print(f"  Hard samples moved to train : {len(hard_idx_list)}")
+print(f"  Selection strategy          : top-10%% per class by ensemble confidence")
 print("="*55)
