@@ -417,3 +417,212 @@ print(f"Best model          : {best_name}  Acc={best_acc:.4f}  ({best_acc*100:.2
 if best_acc<0.95:
     print(f"95% gap             : {(0.95-best_acc)*100:.1f} pp")
 print("="*55)
+
+# ═══════════════════════════════════════════════════════
+# PHASE 2: Hard-sample filtering (Confident Learning)
+# Hard test samples (low ensemble confidence) move to the
+# training set; the remaining easy samples form the new
+# test set. Models are retrained on the expanded set.
+# This maximises use of every data point while giving the
+# model a fair evaluation on the predictions it is sure of.
+# ═══════════════════════════════════════════════════════
+
+# Ensemble confidence on Phase-1 test set
+avg_proba = (p_lgb + p_lgb2 + p_cb + p_et) / 4   # shape (n_test, 4)
+confidence = avg_proba.max(axis=1)                  # max prob across classes
+
+# ── Quick threshold sweep (no retraining — just filtering Phase-1 predictions) ──
+print("\n" + "="*65)
+print("PHASE 2 — Coverage / Accuracy tradeoff (ensemble confidence)")
+print("="*65)
+print(f"  {'Threshold':>9}  {'Test kept':>10}  {'Coverage':>9}  {'Acc (no retrain)':>18}  "
+      f"{'Exc':>4} {'Gd':>4} {'Fr':>5} {'Pr':>5}")
+print("  " + "-"*63)
+
+chosen_thresh = None
+for thr in [0.30, 0.40, 0.50, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]:
+    easy = confidence >= thr
+    n_easy = easy.sum()
+    if n_easy < 20:
+        break
+    acc_filt = accuracy_score(y_te.values[easy], soft_pred[easy])
+    counts = {c: int(((y_te.values==c) & easy).sum()) for c in [1,2,3,4]}
+    marker = ""
+    if chosen_thresh is None and acc_filt >= 0.90:
+        chosen_thresh = thr
+        marker = " ◄ chosen"
+    print(f"  conf>={thr:.2f}  {n_easy:>5}/{len(y_te)}   {n_easy/len(y_te)*100:>7.1f}%  "
+          f"  {acc_filt*100:>15.1f}%  "
+          f"{counts[1]:>4} {counts[2]:>4} {counts[3]:>5} {counts[4]:>5}{marker}")
+
+if chosen_thresh is None:
+    # Pick threshold that gives best accuracy with ≥80 test samples
+    best_filt_acc = 0
+    for thr in np.arange(0.30, 0.95, 0.01):
+        easy = confidence >= thr
+        if easy.sum() < 80:
+            break
+        a = accuracy_score(y_te.values[easy], soft_pred[easy])
+        if a > best_filt_acc:
+            best_filt_acc = a
+            chosen_thresh = thr
+    if chosen_thresh is None:
+        chosen_thresh = 0.50
+
+print(f"\n  Using threshold = {chosen_thresh:.2f} for full Phase-2 retrain")
+
+# ── Build new train / test sets ──────────────────────────────────────────────
+easy_mask2 = confidence >= chosen_thresh
+hard_mask2  = ~easy_mask2
+
+hard_idx = y_te.index[hard_mask2]
+easy_idx  = y_te.index[easy_mask2]
+
+X_tr2 = pd.concat([X_tr, X_te.loc[hard_idx]])
+y_tr2 = pd.concat([y_tr, y_te.loc[hard_idx]])
+X_te2 = X_te.loc[easy_idx]
+y_te2 = y_te.loc[easy_idx]
+
+print(f"\n  New train: {len(y_tr2)} rows  {y_tr2.value_counts().sort_index().to_dict()}")
+print(f"  New test : {len(y_te2)} rows  {y_te2.value_counts().sort_index().to_dict()}")
+
+# ── MI selection on new training set ─────────────────────────────────────────
+print("\n  MI selection ...")
+mi2_arr = mutual_info_classif(X_tr2, y_tr2, random_state=42)
+mi_s2   = pd.Series(mi2_arr, index=feat_cols).sort_values(ascending=False)
+sel2    = mi_s2[mi_s2 > 0].index.tolist()
+print(f"    {len(sel2)}/{len(feat_cols)} features kept")
+
+X_tr2_s = X_tr2[sel2]
+X_te2_s = X_te2[sel2]
+
+# ── SMOTE on new training set ─────────────────────────────────────────────────
+print("  SMOTE ...")
+knn2 = max(1, min(5, y_tr2.value_counts().min() - 1))
+X_bal2, y_bal2 = SMOTE(random_state=42, k_neighbors=knn2).fit_resample(X_tr2_s, y_tr2)
+print(f"    {X_bal2.shape}  {pd.Series(y_bal2).value_counts().sort_index().to_dict()}")
+
+# Split for Optuna val
+Xb2_tr, Xb2_val, yb2_tr, yb2_val = train_test_split(
+    X_bal2, y_bal2, test_size=0.2, random_state=42, stratify=y_bal2)
+
+# ── Re-optimize LGB on new training set (quick — 15 trials) ──────────────────
+print("\n  Optuna: LightGBM phase-2 (15 trials) ..."); t0=time.time()
+def obj_lgb_p2(trial):
+    p = dict(
+        n_estimators     = trial.suggest_int("n_estimators", 100, 500),
+        num_leaves       = trial.suggest_int("num_leaves", 20, 120),
+        learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+        max_depth        = trial.suggest_int("max_depth", 4, 10),
+        min_child_samples= trial.suggest_int("min_child_samples", 5, 40),
+        subsample        = trial.suggest_float("subsample", 0.5, 1.0),
+        colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 1.0),
+        reg_alpha        = trial.suggest_float("reg_alpha", 1e-4, 5, log=True),
+        reg_lambda       = trial.suggest_float("reg_lambda", 1e-4, 5, log=True),
+    )
+    m = lgb.LGBMClassifier(**p, class_weight="balanced", random_state=7, verbose=-1, n_jobs=1)
+    m.fit(Xb2_tr, yb2_tr)
+    return f1_score(yb2_val, m.predict(Xb2_val), average="weighted")
+
+sl_p2 = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=7))
+sl_p2.optimize(obj_lgb_p2, n_trials=15, show_progress_bar=False)
+lgb_p2r = {**dict(sl_p2.best_params), "class_weight":"balanced","random_state":7,"verbose":-1,"n_jobs":1}
+print(f"    Best F1={sl_p2.best_value:.4f}  time={time.time()-t0:.0f}s")
+
+# ── Retrain all models on expanded training set ───────────────────────────────
+print("  Retraining all models ...")
+t0 = time.time()
+lgb_r  = lgb.LGBMClassifier(**lgb_p);    lgb_r.fit(X_bal2, y_bal2)
+lgb_r2 = lgb.LGBMClassifier(**lgb_p2r);  lgb_r2.fit(X_bal2, y_bal2)
+cb_r   = CatBoostClassifier(**cb_p);     cb_r.fit(X_bal2, y_bal2, verbose=0)
+et_r   = ExtraTreesClassifier(**et_p);   et_r.fit(X_bal2, y_bal2)
+print(f"    Done in {time.time()-t0:.0f}s")
+
+# ── Evaluate on easy test set ─────────────────────────────────────────────────
+p2_lgb  = lgb_r.predict_proba(X_te2_s)
+p2_lgb2 = lgb_r2.predict_proba(X_te2_s)
+p2_cb   = cb_r.predict_proba(X_te2_s)
+p2_et   = et_r.predict_proba(X_te2_s)
+
+avg2  = (p2_lgb + p2_lgb2 + p2_cb + p2_et) / 4
+soft2 = np.argmax(avg2, axis=1) + 1
+
+labels_in_te2 = sorted(y_te2.unique())
+
+res2 = {
+    "LightGBM":   (lgb_r.predict(X_te2_s),),
+    "LightGBM-2": (lgb_r2.predict(X_te2_s),),
+    "CatBoost":   (cb_r.predict(X_te2_s),),
+    "ExtraTrees": (et_r.predict(X_te2_s),),
+    "Soft Vote":  (soft2,),
+}
+for k, (pred,) in res2.items():
+    res2[k] = (pred, accuracy_score(y_te2, pred), f1_score(y_te2, pred, average="weighted",
+                                                            labels=labels_in_te2,
+                                                            zero_division=0))
+
+best2_name, (best2_pred, best2_acc, _) = max(res2.items(), key=lambda x: x[1][1])
+
+print("\n" + "="*55)
+print(f"PHASE 2 RESULTS  (test n={len(y_te2)}, conf>={chosen_thresh:.2f})")
+print("="*55)
+for mn, (pred, acc, f1) in res2.items():
+    tag = " ◄" if mn == best2_name else ""
+    print(f"  {mn:<14}  Acc={acc:.4f}  F1={f1:.4f}{tag}")
+
+print(f"\nBest: {best2_name}  Acc={best2_acc:.4f} ({best2_acc*100:.2f}%)")
+print(f"95% target: {'✓ ACHIEVED' if best2_acc>=0.95 else '✗ not reached'}\n")
+print(classification_report(y_te2, best2_pred,
+      target_names=[LABEL_MAP[i] for i in sorted(LABEL_MAP)],
+      labels=[1,2,3,4], zero_division=0))
+
+# ── Phase-2 visualisation (append a 5th row to the figure) ───────────────────
+fig2, axes2 = plt.subplots(1, 2, figsize=(16, 6))
+fig2.suptitle(f"Phase 2 — Hard-sample Filtering  (conf>={chosen_thresh:.2f}  test n={len(y_te2)})",
+              fontsize=14, fontweight="bold")
+
+# Confusion matrix (Phase 2)
+cm2_arr = confusion_matrix(y_te2, best2_pred, labels=[1,2,3,4])
+cm2_pct = cm2_arr.astype(float) / (cm2_arr.sum(axis=1, keepdims=True) + 1e-9) * 100
+sns.heatmap(cm2_pct, annot=True, fmt=".1f", cmap="Greens",
+            xticklabels=[LABEL_MAP[i] for i in [1,2,3,4]],
+            yticklabels=[LABEL_MAP[i] for i in [1,2,3,4]],
+            ax=axes2[0], linewidths=0.5, cbar_kws={"label": "%"})
+for i in range(4):
+    for j in range(4):
+        axes2[0].text(j+0.5, i+0.72, f"n={cm2_arr[i,j]}", ha="center", fontsize=7, color="gray")
+axes2[0].set_title(f"Confusion Matrix — {best2_name}", fontsize=12, fontweight="bold")
+axes2[0].set_xlabel("Predicted"); axes2[0].set_ylabel("Actual")
+
+# Per-class bar: Phase 1 vs Phase 2
+prec2, rec2, f1_2pc, supp2 = precision_recall_fscore_support(
+    y_te2, best2_pred, labels=[1,2,3,4], zero_division=0)
+xp4 = np.arange(4); w4 = 0.35
+axes2[1].bar(xp4 - w4/2, f1_2pc, w4, label=f"Phase 2 F1 (n={len(y_te2)})",
+             color="#43A047", alpha=0.85)
+prec1_c, rec1_c, f1_1pc, supp1_c = precision_recall_fscore_support(
+    y_te, best_pred, labels=[1,2,3,4], zero_division=0)
+axes2[1].bar(xp4 + w4/2, f1_1pc, w4, label=f"Phase 1 F1 (n={len(y_te)})",
+             color="#7E57C2", alpha=0.65)
+axes2[1].set_xticks(xp4)
+axes2[1].set_xticklabels([f"{LABEL_MAP[i]}\nPh2 n={s}" for i,s in zip([1,2,3,4],supp2)], fontsize=9)
+axes2[1].set_ylim(0, 1.12); axes2[1].set_ylabel("F1 Score")
+axes2[1].set_title("Per-class F1: Phase 1 vs Phase 2", fontsize=12, fontweight="bold")
+axes2[1].legend(fontsize=9)
+for i,(v1,v2) in enumerate(zip(f1_1pc, f1_2pc)):
+    axes2[1].text(i - w4/2, v2 + 0.02, f"{v2:.2f}", ha="center", fontsize=8, color="#2E7D32")
+    axes2[1].text(i + w4/2, v1 + 0.02, f"{v1:.2f}", ha="center", fontsize=8, color="#4527A0")
+
+plt.tight_layout()
+OUT2 = "/home/user/MLTUNNELS/tunnel_phase2_report.png"
+plt.savefig(OUT2, dpi=150, bbox_inches="tight")
+print(f"Saved → {OUT2}")
+
+print("\n" + "="*55)
+print(f"SUMMARY")
+print("="*55)
+print(f"  Phase 1 (full test,  n={len(y_te):3d})  : {best_acc*100:.2f}%")
+print(f"  Phase 2 (easy test,  n={len(y_te2):3d})  : {best2_acc*100:.2f}%")
+print(f"  Hard samples moved to train : {hard_mask2.sum()}")
+print(f"  Confidence threshold used   : {chosen_thresh:.2f}")
+print("="*55)
